@@ -110,6 +110,11 @@ conv *gaussian_map;
 #define MONITOR_REPAINT 0
 #endif
 
+/* Do not let a continuous Damage event stream postpone a due repaint
+ * indefinitely.  This is a fairness bound, not a drop policy: every queued
+ * event is still processed in order. */
+#define EVENT_BATCH_MAX 128
+
 static void
 determine_mode(Display *dpy, win *w);
 static bool
@@ -2569,7 +2574,11 @@ static void
 do_paint(Display *dpy){
    if (!all_damage_is_dirty) return;
    paint_all(dpy, all_damage);
-   XSync(dpy, False);
+   if (synchronize) {
+     XSync(dpy, False);
+   } else {
+     XFlush(dpy);
+   }
    g_last_paint_ms = get_time_in_milliseconds();
    all_damage_is_dirty = False;
    clip_changed = False;
@@ -2922,13 +2931,19 @@ main(int argc, char **argv) {
                              .width=root_width , .height=root_height };
     XFixesSetRegion(dpy, g_xregion_tmp, &root_rect, 1);
     paint_all(dpy, g_xregion_tmp);
-    XSync(dpy, False);
+    if (synchronize) {
+      XSync(dpy, False);
+    } else {
+      XFlush(dpy);
+    }
     g_last_paint_ms = get_time_in_milliseconds();
   }
 
   for (;;) {
+    unsigned int events_processed = 0;
+
     /*    dump_wins(); */
-    do {
+    for (;;) {
       if (!QLength(dpy)) {
         XFlush(dpy);
         int poll_result = poll(&ufd, 1, paint_timeout());
@@ -3102,7 +3117,12 @@ main(int argc, char **argv) {
           }
           break;
       }
-    } while (QLength(dpy));
+
+      if (++events_processed >= EVENT_BATCH_MAX) {
+        check_paint(dpy);
+        break;
+      }
+    }
 
     check_paint(dpy);
   }

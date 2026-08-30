@@ -118,7 +118,7 @@ All options:
    -e opacity
     Opacity of window titlebars and borders. (0.0 - 1.0)
    -S
-    Enable synchronous operation for debugging.
+    Enable synchronous operation for debugging. Normal operation is asynchronous.
    -h, --help
     Show usage information.
     --shadow-red value
