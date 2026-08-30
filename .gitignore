@@ -14,5 +14,9 @@ missing
 stamp-h1
 fastcompmgr
 *.o
+*.d
+/tests/test_comp_rect
+/tests/test_ringbuffer
+/tests/test_ringbuffer_no_modulo
 *~
 .geany

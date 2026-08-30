@@ -1,7 +1,6 @@
 
 #include <stdio.h>
 #include <stdbool.h>
-#include <string.h>
 
 #include "cm-root.h"
 #include "cm-global.h"
@@ -19,7 +18,7 @@ const char *root_background_props[] = {
 };
 
 
-static inline int
+static inline unsigned int
 _get_valid_pixmap_depth(Pixmap pxmap) {
   if (!pxmap) return 0;
 
@@ -38,43 +37,52 @@ _get_valid_pixmap_depth(Pixmap pxmap) {
 
 
 // XRenderFind(Standard)Format() is a roundtrip, so cache the results
-static XRenderPictFormat* renderformats[ 33 ] = {NULL};
+static XRenderPictFormat* renderformats[33] = {NULL};
 
-static Picture _create_background_pict(Pixmap pix, int depth)
+static Picture _create_background_pict(Pixmap pix, unsigned int depth)
 {
   XRenderPictureAttributes pa;
-  // Stay safe, and do not cache the fallback render format without further research.
-  renderformats[0] = NULL;
-  if (renderformats[depth] == NULL) {
+  XRenderPictFormat *format = NULL;
+
+  if (depth < sizeof(renderformats) / sizeof(renderformats[0])) {
+    format = renderformats[depth];
+  }
+  if (format == NULL) {
     switch(depth){
       case 0:
           break;
       case 1:
-          renderformats[1] = XRenderFindStandardFormat(g_dpy, PictStandardA1);
+          format = XRenderFindStandardFormat(g_dpy, PictStandardA1);
           break;
       case 8:
-          renderformats[8] = XRenderFindStandardFormat(g_dpy, PictStandardA8);
+          format = XRenderFindStandardFormat(g_dpy, PictStandardA8);
           break;
       case 24:
-          renderformats[24] = XRenderFindStandardFormat(g_dpy, PictStandardRGB24);
+          format = XRenderFindStandardFormat(g_dpy, PictStandardRGB24);
           break;
       case 32:
-          renderformats[32] = XRenderFindStandardFormat(g_dpy, PictStandardARGB32);
+          format = XRenderFindStandardFormat(g_dpy, PictStandardARGB32);
           break;
       default: {
-          fprintf(stderr, "Unhandled root background depth %d - please report!\n", depth);
+          fprintf(stderr, "Unhandled root background depth %u - please report!\n", depth);
           break;
       }
     }
-    if (renderformats[depth] == NULL) {
-      // Use renderformats[0] for all fallback-depths
-      depth = 0;
-      renderformats[0] = XRenderFindVisualFormat(g_dpy, DefaultVisual(g_dpy, g_screen));
+    if (format != NULL && depth < sizeof(renderformats) / sizeof(renderformats[0])) {
+      renderformats[depth] = format;
     }
+  }
+  if (format == NULL) {
+    // Stay safe, and do not cache the fallback render format without further research.
+    format = XRenderFindVisualFormat(g_dpy, DefaultVisual(g_dpy, g_screen));
+  }
+  if (format == NULL) {
+    fprintf(stderr, "Unable to find an X Render format for the root background.\n");
+    return None;
   }
 
   pa.repeat = True;
-  return XRenderCreatePicture(g_dpy, pix, renderformats[depth], CPRepeat, &pa);
+  return XRenderCreatePicture(g_dpy, pix, format, CPRepeat, &pa);
 }
 
 bool root_init(){
@@ -97,62 +105,63 @@ bool root_init(){
 /// background pixmap is found, we create one ourselves using DefaultVisual()
 /// and set a fixed solid background color.
 Picture root_create_tile() {
-  Picture picture;
+  Picture picture = None;
   Atom actual_type;
-  Pixmap pixmap;
+  Pixmap pixmap = None;
   int actual_format;
   unsigned long nitems;
   unsigned long bytes_after;
-  unsigned char *prop;
+  unsigned char *prop = NULL;
   unsigned pict_depth = 0;
-  bool fill;
+  bool owns_pixmap = false;
   int p;
   int res;
   const char* valid_pix_str;
 
-  pixmap = None;
-
   for (p=0; root_background_props[p]; p++) {
+    Pixmap candidate = None;
+
     prop = NULL;
     res = XGetWindowProperty(g_dpy, root,
           XInternAtom(g_dpy, root_background_props[p], False),
-          0, 4, False, AnyPropertyType, &actual_type,
+          0, 1, False, atom_pixmap, &actual_type,
           &actual_format, &nitems, &bytes_after, &prop);
-    if (res != Success || prop == NULL ){
-      continue;
+    if (res == Success && prop != NULL
+          && actual_type == atom_pixmap && actual_format == 32
+          && nitems == 1 && bytes_after == 0) {
+      candidate = (Pixmap)((unsigned long *)prop)[0];
     }
-    if(actual_type == atom_pixmap
-          && actual_format == 32 && nitems == 1) {
-      memcpy(&pixmap, prop, 4);
+    if (prop != NULL) {
+      XFree(prop);
     }
-    XFree(prop);
-    pict_depth = _get_valid_pixmap_depth(pixmap);
+
+    pict_depth = _get_valid_pixmap_depth(candidate);
     if(pict_depth){
+      pixmap = candidate;
       break;
-    } else {
-      pixmap = None;
     }
   }
 
   if(pixmap == None){
     valid_pix_str = "invalid";
     pixmap = XCreatePixmap(g_dpy, root, 1, 1, DefaultDepth(g_dpy, g_screen));
-    fill = true;
+    owns_pixmap = true;
   } else {
     valid_pix_str = "valid";
-    fill = false;
   }
   fprintf(stderr, "info: root background pixmap is %s.\n", valid_pix_str);
   picture = _create_background_pict(pixmap, pict_depth);
 
-  if (fill) {
+  if (owns_pixmap && picture != None) {
     XRenderColor  c;
     c.red = c.green = c.blue = 0x8080;
     c.alpha = 0xffff;
     XRenderFillRectangle(
       g_dpy, PictOpSrc, picture, &c, 0, 0, 1, 1);
   }
+  if (owns_pixmap) {
+    XFreePixmap(g_dpy, pixmap);
+  }
   return picture;
 }
-
 

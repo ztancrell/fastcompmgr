@@ -4,7 +4,7 @@
 fastcompmgr \- a _fast_ compositor for X11
 .SH SYNOPSIS
 .nf
-.B fastcompmgr [\-d display] [\-r radius] [\-o opacity] [\-l left-offset] [\-t top-offset] [\-i opacity] [\-e opacity] [\-cCfFS]
+.B fastcompmgr [\-d display] [\-r radius] [\-o opacity] [\-l left-offset] [\-t top-offset] [\-m opacity] [\-i opacity] [\-e opacity] [\-I step] [\-O step] [\-D milliseconds] [\-cCfFS] [\-\-shadow-red value] [\-\-shadow-green value] [\-\-shadow-blue value] [\-\-refresh-rate Hz]
 .fi
 .SH DESCRIPTION
 .B fastcompmgr
@@ -30,6 +30,9 @@ Specifies the left offset for client-side shadows.
 .BI \-t\ top-offset
 Specifies the top offset for client-side shadows.
 .TP
+.BI \-m\ opacity
+Specifies opacity for menu, dropdown-menu, popup-menu, and combo windows.
+.TP
 .BI \-I\ fade-in-step
 Specifies the opacity change between steps while fading in.
 .TP
@@ -41,6 +44,9 @@ Specifies the time (in milliseconds) between steps in a fade.
 .TP
 .BI \-c
 Enable client-side shadows on windows.
+Shadows are not drawn on menus, popup menus, dropdown menus, combo-box
+popups, or tooltips; those window types expose only an oversized rect with no
+shape information and would render as a transparent box around the popup.
 .TP
 .BI \-f
 When \-c is specified, enables a smooth fade effect for transient windows like
@@ -54,15 +60,30 @@ When \-f is specified, also enables the fade effect when windows change their
 opacity, as with transset(1).
 .TP
 .BI \-i\ opacity
-Specifies inactive window transparency. (0.1 - 1.0)
+Specifies inactive window transparency. (0.0 - 1.0)
 .TP
 .BI \-e\ opacity
-Specifies window frame transparency. (0.1 - 1.0)
+Specifies window frame transparency. (0.0 - 1.0)
 .TP
 .BI \-S
 Enables synchronous operation.  Useful for debugging.
+.TP
+.B \-h, \-\-help
+Prints usage information.
+.TP
+.BI \-\-shadow-red\ value
+Specifies shadow red intensity. (0.0 - 1.0)
+.TP
+.BI \-\-shadow-green\ value
+Specifies shadow green intensity. (0.0 - 1.0)
+.TP
+.BI \-\-shadow-blue\ value
+Specifies shadow blue intensity. (0.0 - 1.0)
+.TP
+.BI \-\-refresh-rate\ Hz
+Overrides the display refresh rate. Zero selects XRandR autodetection.
 .SH BUGS
-Bugs may be reported to https://github.com/tycho-kirchner/fastcompmgr
+Bugs may be reported to https://github.com/ztancrell/fastcompmgr
 .SH AUTHORS
 xcompmgr, originally written by Keith Packard, with contributions from
 Matthew Allum, Eric Anholt, Dan Doel, Thomas Luebking, Matthew Hawn,

@@ -13,13 +13,10 @@ has several other glitches. That's why I traveled back into 2011, where
 this feature was just added, cherry picked some later compton commits
 to get rid of spurious segfaults and memleaks and made that version even
 faster, based on profiling.
-For example, window move- and resize events are limited in their
-event-count and rendered at a somewhat fixed framerate, while
-scrolling is still done as fast as possible. Occluded windows are not
+For example, window move- and resize events are coalesced and all repaint work
+is paced to the display refresh rate. Occluded windows are not
 painted and memory allocations/deallocations are largely avoided,
 allowing for faster repaints of the screen.
-On the downside, fading is currently broken (I don't use it). Sorry
-for that (;
 
 ## Benchmark
 While on my Dell Latitude E5570 window moving, resizing and scrolling
@@ -55,7 +52,7 @@ $ fastcompmgr -o 0.4 -r 12 -c -C &  pid=$!; sleep 4; \
 
 
 ## Installation
-If you're lazy, just grab the binary from the [release page](https://github.com/tycho-kirchner/fastcompmgr/releases).
+If you're lazy, just grab the binary from the [release page](https://github.com/ztancrell/fastcompmgr/releases).
 
 Otherwise, install the development versions of the following libraries:
 ### Dependencies:
@@ -65,8 +62,10 @@ Otherwise, install the development versions of the following libraries:
 * libxdamage
 * libxfixes
 * libxrender
+* libxrandr
 * pkg-config
 * make
+* a C compiler
 
 To build:
 
@@ -80,7 +79,7 @@ $ make install
 ~~~ bash
 $ fastcompmgr -o 0.4 -r 12 -c -C
 ~~~
-All options (currently fading doesn't work):
+All options:
 ~~~
    -d display
     Which display should be managed.
@@ -93,21 +92,41 @@ All options (currently fading doesn't work):
    -t top-offset
     The top offset for shadows. (default -15)
    -m opacity
-    The opacity for menus. (default 1.0)
+    The opacity for menu, dropdown-menu, popup-menu, and combo windows.
+    (default 1.0)
    -c
-    Enabled client-side shadows on windows.
+    Enable client-side shadows on windows. Shadows are not drawn on menus,
+    popup menus, dropdown menus, combo-box popups, or tooltips, because those
+    window types use an oversized rect with no shape info and would render as
+    a transparent box around the popup.
    -C
     Avoid drawing shadows on dock/panel windows.
+   -f
+    Fade windows in and out when opening, closing, hiding, or restoring.
+   -F
+    Also fade opacity changes.
+   -I fade-in-step
+    Opacity change per fade step. (default 0.028)
+   -O fade-out-step
+    Opacity change per fade step. (default 0.03)
+   -D fade-delta-time
+    Time between fade steps in milliseconds. (default 10)
    -i opacity
-    Opacity of inactive windows. (0.1 - 1.0)
+    Opacity of inactive windows. (0.0 - 1.0)
    -e opacity
-    Opacity of window titlebars and borders. (0.1 - 1.0)
+    Opacity of window titlebars and borders. (0.0 - 1.0)
+   -S
+    Enable synchronous operation for debugging.
+   -h, --help
+    Show usage information.
     --shadow-red value
     Red color value of shadow (0.0 - 1.0, defaults to 0).
     --shadow-green value
     Green color value of shadow (0.0 - 1.0, defaults to 0).
     --shadow-blue value
     Blue color value of shadow (0.0 - 1.0, defaults to 0).
+    --refresh-rate N
+    Override display refresh rate in Hz (0 = autodetect via XRandR, default).
 
 ~~~
 

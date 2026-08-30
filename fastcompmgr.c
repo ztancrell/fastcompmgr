@@ -12,6 +12,7 @@
  */
 
 #include <assert.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -29,6 +30,7 @@
 #include <X11/extensions/Xcomposite.h>
 #include <X11/extensions/Xdamage.h>
 #include <X11/extensions/Xrender.h>
+#include <X11/extensions/Xrandr.h>
 
 #include "cm-global.h"
 #include "cm-event.h"
@@ -67,6 +69,9 @@ Picture cshadow_picture;
 Picture root_tile;
 XserverRegion all_damage;
 XserverRegion g_xregion_tmp;
+XserverRegion screen_damage;
+int g_paint_interval_ms;
+int64_t g_last_paint_ms = 0;
 Bool all_damage_is_dirty;
 Bool clip_changed;
 #if HAS_NAME_WINDOW_PIXMAP
@@ -119,6 +124,10 @@ set_paint_ignore_region_dirty(void);
 
 static XserverRegion
 win_extents(Display *dpy, win *w);
+static void
+invalidate_shadow(Display *dpy, win *w);
+static void
+add_damage(Display *dpy, XserverRegion damage);
 
 int shadow_radius = 12;
 int shadow_offset_x = -15;
@@ -128,7 +137,7 @@ double shadow_opacity = .75;
 double fade_in_step = 0.028;
 double fade_out_step = 0.03;
 int fade_delta = 10;
-int fade_time = 0;
+int64_t fade_time = 0;
 Bool fade_trans = False;
 
 double inactive_opacity = 0;
@@ -203,6 +212,7 @@ set_fade(Display *dpy, win *w, double start,
   f = find_fade(w);
   if (!f) {
     f = malloc(sizeof(fade));
+    if (!f) return;
     f->next = 0;
     f->w = w;
     f->cur = start;
@@ -223,6 +233,8 @@ set_fade(Display *dpy, win *w, double start,
     f->step = step;
   } else if (f->cur > finish) {
     f->step = -step;
+  } else {
+    f->step = 0;
   }
 
   f->callback = callback;
@@ -234,12 +246,7 @@ set_fade(Display *dpy, win *w, double start,
 
   determine_mode(dpy, w);
 
-  if (w->shadow) {
-    // rebuild the shadow
-    XRenderFreePicture(dpy, w->shadow);
-    w->shadow = None;
-    win_extents(dpy, w);
-  }
+  invalidate_shadow(dpy, w);
 
   /* fading windows need to be drawn, mark
      them as damaged.  when a window maps,
@@ -252,8 +259,8 @@ set_fade(Display *dpy, win *w, double start,
 
 int
 fade_timeout(void) {
-  int now;
-  int delta;
+  int64_t now;
+  int64_t delta;
 
   if (!fades) return -1;
 
@@ -263,14 +270,14 @@ fade_timeout(void) {
   if (delta < 0) delta = 0;
 /* printf("timeout %d\n", delta); */
 
-  return delta;
+  return delta > INT_MAX ? INT_MAX : (int)delta;
 }
 
 void
 run_fades(Display *dpy) {
-  int now = get_time_in_milliseconds();
+  int64_t now = get_time_in_milliseconds();
   fade *next = fades;
-  int steps;
+  int64_t steps;
   Bool need_dequeue;
 
 #if 0
@@ -312,12 +319,7 @@ run_fades(Display *dpy) {
 
     determine_mode(dpy, w);
 
-    if (w->shadow) {
-      // rebuild the shadow
-      XRenderFreePicture(dpy, w->shadow);
-      w->shadow = None;
-      win_extents(dpy, w);
-    }
+    invalidate_shadow(dpy, w);
 
     /* Must do this last as it might
        destroy f->w in callbacks */
@@ -344,6 +346,7 @@ make_gaussian_map(Display *dpy, double r) {
   double g;
 
   c = malloc(sizeof(conv) + size * size * sizeof(double));
+  if (!c) return NULL;
   c->size = size;
   c->data = (double *) (c + 1);
   t = 0.0;
@@ -448,6 +451,14 @@ presum_gaussian(conv *map) {
 
   shadow_corner = (unsigned char *)(malloc((Gsize + 1) * (Gsize + 1) * 26));
   shadow_top = (unsigned char *)(malloc((Gsize + 1) * 26));
+  if (!shadow_corner || !shadow_top) {
+    free(shadow_corner);
+    free(shadow_top);
+    shadow_corner = NULL;
+    shadow_top = NULL;
+    Gsize = 0;
+    return;
+  }
 
   for (x = 0; x <= Gsize; x++) {
     shadow_top[25 * (Gsize + 1) + x] =
@@ -717,6 +728,152 @@ solid_picture(Display *dpy, Bool argb, double a,
 }
 
 
+// 9-patch shadow tiles: size-independent shadow pieces, built lazily per
+// opacity level (0..25) and shared by every window. For large SHADOW_FULL
+// windows this replaces the per-window full-size alpha mask, so resizing a big
+// window no longer mallocs+memsets+uploads an O(w*h) XImage every frame.
+typedef struct {
+  Picture corner_tl, corner_tr, corner_bl, corner_br;
+  Picture edge_top, edge_bottom, edge_left, edge_right;
+  Picture center;
+  Bool built;
+} shadow_tiles;
+
+static shadow_tiles g_shadow_tiles[26];
+
+// Wrap an 8-bit alpha buffer as an A8 Picture. Mirrors shadow_picture()'s
+// proven pixmap->picture->free-pixmap dance; XDestroyImage frees `data`.
+static Picture
+a8_picture_from_data(Display *dpy, unsigned char *data,
+                     int width, int height, Bool repeat) {
+  XImage *img;
+  Pixmap pixmap;
+  Picture picture;
+  GC gc;
+  XRenderPictureAttributes pa;
+
+  img = XCreateImage(dpy, DefaultVisual(dpy, DefaultScreen(dpy)), 8,
+    ZPixmap, 0, (char *) data, width, height, 8, width);
+  if (!img) { free(data); return None; }
+
+  pixmap = XCreatePixmap(dpy, root, width, height, 8);
+  if (!pixmap) { XDestroyImage(img); return None; }
+
+  pa.repeat = repeat;
+  picture = XRenderCreatePicture(dpy, pixmap,
+    XRenderFindStandardFormat(dpy, PictStandardA8),
+    repeat ? CPRepeat : 0, &pa);
+  if (!picture) { XDestroyImage(img); XFreePixmap(dpy, pixmap); return None; }
+
+  gc = XCreateGC(dpy, pixmap, 0, 0);
+  if (!gc) {
+    XRenderFreePicture(dpy, picture);
+    XDestroyImage(img);
+    XFreePixmap(dpy, pixmap);
+    return None;
+  }
+
+  XPutImage(dpy, pixmap, gc, img, 0, 0, 0, 0, width, height);
+  XFreeGC(dpy, gc);
+  XDestroyImage(img);
+  XFreePixmap(dpy, pixmap);
+  return picture;
+}
+
+// Build the 9 tiles for opacity level `op` (once). Values come straight from
+// sum_gaussian() with a 2*gsize filter window, which is exactly what make_shadow
+// / presum_gaussian produce for a large window's corners/edges/center - so the
+// 9-patch is pixel-identical to the old full-size shadow for eligible windows.
+static void
+ensure_shadow_tiles(Display *dpy, int op) {
+  if (g_shadow_tiles[op].built) return;
+
+  const int g = gaussian_map->size;
+  if (g <= 0) return;  // ponytail: degenerate blur radius (e.g. -r 0); caller falls back
+  const int center = g / 2;
+  const int win = 2 * g;
+  const double od = (double) op / 25.0;
+  int x, y;
+  unsigned char *d;
+
+  // corners (g x g): TL, and h/v mirrors for the other three
+  d = malloc(g * g);
+  for (y = 0; y < g; y++) for (x = 0; x < g; x++)
+    d[y * g + x] = sum_gaussian(gaussian_map, od, x - center, y - center, win, win);
+  g_shadow_tiles[op].corner_tl = a8_picture_from_data(dpy, d, g, g, False);
+
+  d = malloc(g * g);
+  for (y = 0; y < g; y++) for (x = 0; x < g; x++)
+    d[y * g + x] = sum_gaussian(gaussian_map, od, (g - 1 - x) - center, y - center, win, win);
+  g_shadow_tiles[op].corner_tr = a8_picture_from_data(dpy, d, g, g, False);
+
+  d = malloc(g * g);
+  for (y = 0; y < g; y++) for (x = 0; x < g; x++)
+    d[y * g + x] = sum_gaussian(gaussian_map, od, x - center, (g - 1 - y) - center, win, win);
+  g_shadow_tiles[op].corner_bl = a8_picture_from_data(dpy, d, g, g, False);
+
+  d = malloc(g * g);
+  for (y = 0; y < g; y++) for (x = 0; x < g; x++)
+    d[y * g + x] = sum_gaussian(gaussian_map, od, (g - 1 - x) - center, (g - 1 - y) - center, win, win);
+  g_shadow_tiles[op].corner_br = a8_picture_from_data(dpy, d, g, g, False);
+
+  // top/bottom edges (1 wide x g tall, repeated horizontally)
+  d = malloc(g);
+  for (y = 0; y < g; y++) d[y] = sum_gaussian(gaussian_map, od, y - center, center, win, win);
+  g_shadow_tiles[op].edge_top = a8_picture_from_data(dpy, d, 1, g, True);
+
+  d = malloc(g);
+  for (y = 0; y < g; y++) d[y] = sum_gaussian(gaussian_map, od, (g - 1 - y) - center, center, win, win);
+  g_shadow_tiles[op].edge_bottom = a8_picture_from_data(dpy, d, 1, g, True);
+
+  // left/right edges (g wide x 1 tall, repeated vertically)
+  d = malloc(g);
+  for (x = 0; x < g; x++) d[x] = sum_gaussian(gaussian_map, od, x - center, center, win, win);
+  g_shadow_tiles[op].edge_left = a8_picture_from_data(dpy, d, g, 1, True);
+
+  d = malloc(g);
+  for (x = 0; x < g; x++) d[x] = sum_gaussian(gaussian_map, od, (g - 1 - x) - center, center, win, win);
+  g_shadow_tiles[op].edge_right = a8_picture_from_data(dpy, d, g, 1, True);
+
+  // solid center
+  d = malloc(1);
+  d[0] = sum_gaussian(gaussian_map, od, center, center, win, win);
+  g_shadow_tiles[op].center = a8_picture_from_data(dpy, d, 1, 1, True);
+
+  g_shadow_tiles[op].built = True;
+}
+
+// Composite a window's shadow from the 9 shared tiles (replaces the single
+// full-size composite). The tiled rects exactly partition the sw x sh shadow.
+static void
+render_shadow_9patch(Display *dpy, win *w) {
+  const shadow_tiles *t = &g_shadow_tiles[w->shadow_opacity_int];
+  const int g = gaussian_map->size;
+  const int sx = w->a.x + w->shadow_dx;
+  const int sy = w->a.y + w->shadow_dy;
+  const int sw = w->shadow_width;
+  const int sh = w->shadow_height;
+  const int mw = sw - 2 * g;   // middle (stretched) width  > 0 by eligibility
+  const int mh = sh - 2 * g;   // middle (stretched) height > 0 by eligibility
+
+#define COMP(mask, dx, dy, ww, hh) \
+  XRenderComposite(dpy, PictOpOver, cshadow_picture, (mask), root_buffer, \
+    0, 0, 0, 0, sx + (dx), sy + (dy), (ww), (hh))
+
+  COMP(t->corner_tl, 0,      0,      g,  g);
+  COMP(t->corner_tr, sw - g, 0,      g,  g);
+  COMP(t->corner_bl, 0,      sh - g, g,  g);
+  COMP(t->corner_br, sw - g, sh - g, g,  g);
+  COMP(t->edge_top,    g,      0,      mw, g);
+  COMP(t->edge_bottom, g,      sh - g, mw, g);
+  COMP(t->edge_left,   0,      g,      g,  mh);
+  COMP(t->edge_right,  sw - g, g,      g,  mh);
+  COMP(t->center,      g,      g,      mw, mh);
+
+#undef COMP
+}
+
+
 static void
 paint_root(Display *dpy) {
   if (!root_tile) {
@@ -770,6 +927,12 @@ static bool shadow_should_render(shadowtype t){
   return false;
 }
 
+static bool
+win_needs_second_pass(const win *w) {
+  return shadow_should_render(w->shadow_type)
+      || w->mode != WINDOW_SOLID || HAS_FRAME_OPACITY(w);
+}
+
 static XserverRegion
 win_extents(Display *dpy, win *w) {
   XRectangle r;
@@ -785,26 +948,47 @@ win_extents(Display *dpy, win *w) {
 
   if (shadow_should_render(w->shadow_type)) {
     XRectangle sr;
+    int gsize = gaussian_map->size;
+    int win_w = w->a.width + w->a.border_width * 2;
+    int win_h = w->a.height + w->a.border_width * 2;
+
+    double opacity = shadow_opacity;
+    if (w->mode != WINDOW_SOLID) {
+      opacity = opacity * ((double)w->opacity) / ((double)OPAQUE);
+    }
+    if (HAS_FRAME_OPACITY(w)) {
+      opacity = opacity * frame_opacity;
+    }
 
     w->shadow_dx = shadow_offset_x;
     w->shadow_dy = shadow_offset_y;
 
-    if (!w->shadow) {
-      double opacity = shadow_opacity;
-
-      if (w->mode != WINDOW_SOLID) {
-        opacity = opacity * ((double)w->opacity) / ((double)OPAQUE);
+    // 9-patch fast path: a full (opaque-center) shadow on a window bigger than
+    // the blur kernel is just corners+edges+solid-center, all size-independent.
+    // Composite it from shared tiles so a resize never rebuilds an O(w*h) mask.
+    // SHADOW_NOCENTER keeps the per-window path (its cleared center depends on
+    // window size/offset), as do windows too small to tile.
+    if (w->shadow_type == SHADOW_FULL && gsize > 0 && win_w > gsize && win_h > gsize) {
+      int op = (int)(opacity * 25);
+      if (op < 0) op = 0;
+      if (op > 25) op = 25;
+      ensure_shadow_tiles(dpy, op);
+      if (w->shadow) {
+        XRenderFreePicture(dpy, w->shadow);
+        w->shadow = None;
       }
-
-      if (HAS_FRAME_OPACITY(w)) {
-        opacity = opacity * frame_opacity;
+      w->shadow_9patch = True;
+      w->shadow_opacity_int = op;
+      w->shadow_width = win_w + gsize;
+      w->shadow_height = win_h + gsize;
+    } else {
+      w->shadow_9patch = False;
+      if (!w->shadow) {
+        w->shadow = shadow_picture(
+          dpy, opacity, w->shadow_type,
+          win_w, win_h,
+          &w->shadow_width, &w->shadow_height);
       }
-
-      w->shadow = shadow_picture(
-        dpy, opacity, w->shadow_type,
-        w->a.width + w->a.border_width * 2,
-        w->a.height + w->a.border_width * 2,
-        &w->shadow_width, &w->shadow_height);
     }
 
     sr.x = w->a.x + w->shadow_dx;
@@ -837,6 +1021,25 @@ win_extents(Display *dpy, win *w) {
   }
   return w->extents;
 
+}
+
+/* Shadow geometry and opacity depend on the current rendering mode.  The
+ * shared 9-patch path has no per-window Picture, so invalidating only
+ * w->shadow leaves stale tiles after opacity/focus changes. */
+static void
+invalidate_shadow(Display *dpy, win *w) {
+  if (w->shadow) {
+    XRenderFreePicture(dpy, w->shadow);
+    w->shadow = None;
+  }
+  w->shadow_9patch = False;
+  w->shadow_opacity_int = 0;
+  w->shadow_type = SHADOW_UNKNOWN;
+
+  if (w->extents) {
+    add_damage(dpy, w->extents);
+    add_damage(dpy, win_extents(dpy, w));
+  }
 }
 
 static XserverRegion
@@ -897,7 +1100,7 @@ get_frame_extents(win* w,
                   unsigned int *right,
                   unsigned int *top,
                   unsigned int *bottom) {
-  long *extents;
+  unsigned long *extents;
   Atom type;
   int format;
   unsigned long nitems, after;
@@ -934,13 +1137,13 @@ get_frame_extents(win* w,
 
   result = XGetWindowProperty(
     dpy, client_window, atom_net_frame_extents,
-    0L, 4L, False, AnyPropertyType,
+    0L, 4L, False, XA_CARDINAL,
     &type, &format, &nitems, &after,
     (unsigned char **)&data);
 
   if (result == Success) {
-    if (nitems == 4 && after == 0) {
-      extents = (long *)data;
+    if (data && type == XA_CARDINAL && format == 32 && nitems == 4 && after == 0) {
+      extents = (unsigned long *)data;
       *left =
         (unsigned int)extents[0];
       *right =
@@ -1025,6 +1228,7 @@ paint_all(Display *dpy, XserverRegion region) {
 #endif
 
   XFixesSetPictureClipRegion(dpy, root_picture, 0, 0, region);
+  XFixesCopyRegion(dpy, screen_damage, region);
 
 #if MONITOR_REPAINT
   XRenderComposite(
@@ -1084,15 +1288,6 @@ paint_all(Display *dpy, XserverRegion region) {
     printf(" 0x%x", w->id);
 #endif
 
-    if (clip_changed) {
-      if (w->border_size) {
-        set_ignore(dpy, NextRequest(dpy));
-        XFixesDestroyRegion(dpy, w->border_size);
-        w->border_size = None;
-      }
-      win_extents(dpy, w);
-    }
-
     if (!w->border_size) {
       w->border_size = border_size (dpy, w);
     }
@@ -1128,10 +1323,14 @@ paint_all(Display *dpy, XserverRegion region) {
         x, y, wid, hei);
     }
 
-    XFixesCopyRegion(dpy, w->border_clip, region);
-
-    w->prev_trans = t;
-    t = w;
+    if (win_needs_second_pass(w)) {
+      if (!w->border_clip) {
+        w->border_clip = XFixesCreateRegion(dpy, 0, 0);
+      }
+      XFixesCopyRegion(dpy, w->border_clip, region);
+      w->prev_trans = t;
+      t = w;
+    }
   }
 
 #if DEBUG_REPAINT
@@ -1148,11 +1347,15 @@ paint_all(Display *dpy, XserverRegion region) {
       root_buffer, 0, 0, w->border_clip);
 
     if(shadow_should_render(w->shadow_type)) {
-      XRenderComposite(
-        dpy, PictOpOver, cshadow_picture, w->shadow,
-        root_buffer, 0, 0, 0, 0,
-        w->a.x + w->shadow_dx, w->a.y + w->shadow_dy,
-        w->shadow_width, w->shadow_height);
+      if (w->shadow_9patch) {
+        render_shadow_9patch(dpy, w);
+      } else if (w->shadow) {
+        XRenderComposite(
+          dpy, PictOpOver, cshadow_picture, w->shadow,
+          root_buffer, 0, 0, 0, 0,
+          w->a.x + w->shadow_dx, w->a.y + w->shadow_dy,
+          w->shadow_width, w->shadow_height);
+      }
     }
 
     if (w->opacity != OPAQUE && !w->alpha_pict) {
@@ -1197,6 +1400,11 @@ paint_all(Display *dpy, XserverRegion region) {
         unsigned int b = w->bottom_width;
         unsigned int r = w->right_width;
 
+        if (l > (unsigned int)wid) l = wid;
+        if (r > (unsigned int)wid - l) r = (unsigned int)wid - l;
+        if (t > (unsigned int)hei) t = hei;
+        if (b > (unsigned int)hei - t) b = (unsigned int)hei - t;
+
         /* top */
         XRenderComposite(
           dpy, PictOpOver, w->picture, w->alpha_border_pict, root_buffer,
@@ -1226,7 +1434,7 @@ paint_all(Display *dpy, XserverRegion region) {
   }
 
 #if ! MONITOR_REPAINT
-    XFixesSetPictureClipRegion(dpy, root_buffer, 0, 0, None);
+    XFixesSetPictureClipRegion(dpy, root_buffer, 0, 0, screen_damage);
     XRenderComposite(
       dpy, PictOpSrc, root_buffer, None,
       root_picture, 0, 0, 0, 0,
@@ -1273,6 +1481,9 @@ repair_win(Display *dpy, win *w) {
   XserverRegion parts;
 
   if (!w->damaged) {
+    /* The first DamageNotify after a map/unmap represents a new window
+     * image. Repaint its complete extents, as the original implementation
+     * did, rather than deferring a possibly incomplete damage region. */
     parts = win_extents(dpy, w);
     set_ignore(dpy, NextRequest(dpy));
     XDamageSubtract(dpy, w->damage, None, None);
@@ -1364,17 +1575,19 @@ get_wintype_prop(Display * dpy, Window w) {
 
     if (unlikely(result != Success)) break;
 
-    if (likely(data != None)) {
+    if (likely(data != None && actual == XA_ATOM && format == 32 && n == 1)) {
       int i;
+      Atom a = ((Atom *)data)[0];
       for (i = 1; i < NUM_WINTYPES; ++i) {
-        Atom a;
-        memcpy(&a, data, sizeof(Atom));
         if (a == win_type[i]) {
           /* known type */
           XFree((void *) data);
           return i;
         }
       }
+      XFree((void *) data);
+    }
+    else if (data != None) {
       XFree((void *) data);
     }
     ++off;
@@ -1417,6 +1630,8 @@ free_out:
 
 static unsigned int
 get_opacity_prop(Display *dpy, win *w, unsigned int def);
+static uint
+win_suggest_opacity(win *w, bool *is_userdefined);
 
 static void
 handle_ConfigureNotify(Display *dpy, XConfigureEvent *ce);
@@ -1431,10 +1646,6 @@ map_win(Display *dpy, Window id,
   w->a.map_state = IsViewable;
   w->window_type = determine_wintype(dpy, w->id, w->id);
 
-  if (! w->border_clip) {
-    w->border_clip = XFixesCreateRegion(dpy, 0, 0);
-  }
-
 #if 0
   printf("window 0x%x type %s\n",
     w->id, wintype_name(w->window_type));
@@ -1444,8 +1655,7 @@ map_win(Display *dpy, Window id,
      so that no property changes are lost */
   XSelectInput(dpy, id, PropertyChangeMask | FocusChangeMask);
 
-  // this causes problems for inactive transparency
-  //w->opacity = get_opacity_prop(dpy, w, OPAQUE);
+  w->opacity = win_suggest_opacity(w, &w->userdefined_opacity);
 
   determine_mode(dpy, w);
 
@@ -1549,9 +1759,10 @@ static bool is_gtk_frame_extent(Display *dpy, Window w){
 
   result = XGetWindowProperty(dpy, w, atom_gtk_frame_extents, 0, LONG_MAX,
     false, XA_CARDINAL, &type, &format, &nitems, &after, (unsigned char **)&data);
-  if (result == Success && data!=NULL) {
+  if (result == Success && data != NULL) {
+    bool valid = type == XA_CARDINAL && format == 32 && nitems == 4 && after == 0;
     XFree((void *)data);
-    return nitems == 4 ;
+    return valid;
   }
   return false;
 }
@@ -1560,24 +1771,39 @@ static bool is_gtk_frame_extent(Display *dpy, Window w){
    not found: default
    otherwise the value
  */
-static unsigned int
-get_opacity_prop(Display *dpy, win *w, unsigned int def) {
+static bool
+get_opacity_prop_for_window(Display *dpy, Window window, unsigned int *opacity) {
   Atom actual;
   int format;
   unsigned long n, left;
 
-  unsigned char *data;
+  unsigned char *data = NULL;
   int result = XGetWindowProperty(
-    dpy, w->id, atom_opacity, 0L, 1L, False,
+    dpy, window, atom_opacity, 0L, 1L, False,
     XA_CARDINAL, &actual, &format, &n, &left, &data);
 
-  if (result == Success && data != NULL) {
-    unsigned int i;
-    memcpy(&i, data, sizeof(unsigned int));
+  if (result == Success && data != NULL && actual == XA_CARDINAL
+      && format == 32 && n == 1 && left == 0) {
+    unsigned long value = ((unsigned long *)data)[0];
     XFree((void *)data);
-    return i;
+    if (value <= UINT_MAX) {
+      *opacity = (unsigned int)value;
+      return true;
+    }
+    return false;
   }
+  if (data) XFree((void *)data);
+  return false;
+}
 
+static unsigned int
+get_opacity_prop(Display *dpy, win *w, unsigned int def) {
+  unsigned int opacity;
+  if (get_opacity_prop_for_window(dpy, w->id, &opacity)) return opacity;
+
+  Window client = find_client_win(dpy, w->id);
+  if (client && client != w->id
+      && get_opacity_prop_for_window(dpy, client, &opacity)) return opacity;
   return def;
 }
 
@@ -1651,12 +1877,7 @@ set_opacity(Display *dpy, win *w, unsigned long opacity) {
   } else {
     w->opacity = opacity;
     determine_mode(dpy, w);
-    if (w->shadow) {
-      // rebuild the shadow
-      XRenderFreePicture(dpy, w->shadow);
-      w->shadow = None;
-      win_extents(dpy, w);
-    }
+    invalidate_shadow(dpy, w);
   }
   set_paint_ignore_region_dirty();
 }
@@ -1716,6 +1937,7 @@ add_win(Display *dpy, Window id, Window prev) {
   new->border_size = None;
   new->extents = None;
   new->shadow = None;
+  new->shadow_9patch = False;
 
   // we used calloc, so no need to set zeroes
   // new->shadow_dx = 0;
@@ -1791,11 +2013,14 @@ restack_win(Display *dpy, win *w, Window new_above) {
 static void
 do_configure_win(Display *dpy, win* w){
   XConfigureEvent* ce = &w->queue_configure;
+  int dx = ce->x - w->a.x;
+  int dy = ce->y - w->a.y;
+  bool border_changed = w->a.border_width != ce->border_width;
 
   w->need_configure = False;
   w->a.x = ce->x;
   w->a.y = ce->y;
-  if (w->configure_size_changed) {
+  if (w->configure_size_changed || border_changed) {
 
 #if HAS_NAME_WINDOW_PIXMAP
     if (w->pixmap) {
@@ -1817,6 +2042,23 @@ do_configure_win(Display *dpy, win* w){
   w->a.width = ce->width;
   w->a.height = ce->height;
   w->a.border_width = ce->border_width;
+  bool override_changed = w->a.override_redirect != ce->override_redirect;
+  w->a.override_redirect = ce->override_redirect;
+  if (override_changed) invalidate_shadow(dpy, w);
+
+  // border_size is this window's bounding region in screen coordinates, so it
+  // only changes when this window itself moves/resizes - invalidate it here so
+  // paint_all rebuilds it. Previously paint_all destroyed+recreated border_size
+  // (and extents) for *every* painted window on *every* clip_changed, needlessly
+  // churning regions of non-moving windows during a drag.
+  // ponytail: reshapes (XShape) without a configure are not tracked here, same
+  // as the rest of the code; the next configure refreshes it.
+  if (w->border_size && (w->configure_size_changed || border_changed)) {
+    XFixesDestroyRegion(dpy, w->border_size);
+    w->border_size = None;
+  } else if (w->border_size && (dx || dy)) {
+    XFixesTranslateRegion(dpy, w->border_size, dx, dy);
+  }
 
   if (w->a.map_state != IsUnmapped
 #if CAN_DO_USABLE
@@ -1831,7 +2073,6 @@ do_configure_win(Display *dpy, win* w){
   }
 
   clip_changed = True;
-  w->a.override_redirect = ce->override_redirect;
   w->configure_size_changed = false;
   set_paint_ignore_region_dirty();
 }
@@ -1858,7 +2099,8 @@ handle_ConfigureNotify(Display *dpy, XConfigureEvent *ce) {
   // invalidates the pixmap, so remember any resize event.
   g_configure_needed = True;
   w->need_configure = True;
-  if (w->a.width != ce->width || w->a.height != ce->height) {
+  if (w->a.width != ce->width || w->a.height != ce->height
+      || w->a.border_width != ce->border_width) {
     w->configure_size_changed = true;
   }
 
@@ -2042,7 +2284,7 @@ damage_win(Display *dpy, XDamageNotifyEvent *de) {
 
   if (w->usable)
 #endif
-    repair_win(dpy, w);
+  repair_win(dpy, w);
 }
 
 static int
@@ -2180,6 +2422,41 @@ ev_window(XEvent *ev) {
 }
 #endif
 
+static bool
+parse_int_option(const char *text, int min, int max, int *value) {
+  char *end;
+  long parsed;
+
+  errno = 0;
+  parsed = strtol(text, &end, 10);
+  if (errno || end == text || *end != '\0' || parsed < min || parsed > max) {
+    return false;
+  }
+  *value = (int)parsed;
+  return true;
+}
+
+static bool
+parse_double_option(const char *text, double min, double max, double *value) {
+  char *end;
+  double parsed;
+
+  errno = 0;
+  parsed = strtod(text, &end);
+  if (errno || end == text || *end != '\0' || !isfinite(parsed)
+      || parsed < min || parsed > max) {
+    return false;
+  }
+  *value = parsed;
+  return true;
+}
+
+static void
+invalid_option(const char *option, const char *value) {
+  fprintf(stderr, "Invalid value for %s: %s\n", option, value);
+  exit(2);
+}
+
 void
 usage(char *program, int exitcode) {
   fprintf(stderr, "%s v0.6.1\n", program);
@@ -2204,9 +2481,9 @@ usage(char *program, int exitcode) {
     -D fade-delta-time
     The time between steps in a fade in milliseconds. (default 10)
     -m opacity
-    The opacity for menus. (default 1.0)
+    The opacity for menu, dropdown-menu, popup-menu, and combo windows. (default 1.0)
     -c
-    Enabled client-side shadows on windows.
+    Enable client-side shadows on windows.
     -C
     Avoid drawing shadows on dock/panel windows.
     -f
@@ -2214,17 +2491,21 @@ usage(char *program, int exitcode) {
     -F
     Fade windows during opacity changes.
     -i opacity
-    Opacity of inactive windows. (0.1 - 1.0)
+    Opacity of inactive windows. (0.0 - 1.0)
     -e opacity
-    Opacity of window titlebars and borders. (0.1 - 1.0)
+    Opacity of window titlebars and borders. (0.0 - 1.0)
     -S
     Enable synchronous operation (for debugging).
+    -h, --help
+    Show this help text.
     --shadow-red value
     Red color value of shadow (0.0 - 1.0, defaults to 0).
     --shadow-green value
     Green color value of shadow (0.0 - 1.0, defaults to 0).
     --shadow-blue value
-    Blue color value of shadow (0.0 - 1.0, defaults to 0).)SOMERANDOMTEXT"
+    Blue color value of shadow (0.0 - 1.0, defaults to 0).
+    --refresh-rate N
+    Override display refresh rate in Hz (0 = autodetect via XRandR, default).)SOMERANDOMTEXT"
   );
   fprintf(stderr, "\n");
 
@@ -2286,49 +2567,42 @@ static void run_configures(Display *dpy){
 
 static void
 do_paint(Display *dpy){
+   if (!all_damage_is_dirty) return;
    paint_all(dpy, all_damage);
    XSync(dpy, False);
+   g_last_paint_ms = get_time_in_milliseconds();
    all_damage_is_dirty = False;
    clip_changed = False;
 }
 
-static Bool configure_timer_started = False;
-static int configure_time = 0;
-
-/// When a window is moved, or resized, a lot of ConfigureNotify events
-/// occur. However, painting and Xsyncing of complex windows, e.g.
-/// web-browser contents, may introduce a considerable lag. Therefore, for each
-/// window, we cache the "latest" configure event and paint the events after
-/// some timeout. On the other hand, we want to handle other events, especially
-/// damage events, as fast as possible, so we do not timeout in this case.
 static void
 check_paint(Display *dpy){
-  if(unlikely(g_configure_needed)){
-    const int EVERY_MILISEC = 2;
-    if(!configure_timer_started){
-      // Not strictly necessary to paint now, but until we run, the
-      // configured window has already been moving/resizing for a (short)
-      // while, so give early feedback to the user.
-      run_configures(dpy);
-      do_paint(dpy);
-      configure_timer_started = True;
-      configure_time = get_time_in_milliseconds() + EVERY_MILISEC;
-    } else {
-      int delta;
-      delta = get_time_in_milliseconds() - configure_time;
-      if (delta < EVERY_MILISEC){
-        return;
+  if (fade_timeout() == 0) run_fades(dpy);
+
+  if (g_configure_needed || all_damage_is_dirty) {
+    int64_t now = get_time_in_milliseconds();
+    if (now - g_last_paint_ms >= g_paint_interval_ms) {
+      if (g_configure_needed) {
+        g_configure_needed = False;
+        run_configures(dpy);
       }
-      g_configure_needed = False;
-      configure_timer_started = False;
-      run_configures(dpy);
-      do_paint(dpy);
-    }
-  } else {
-    if(likely(all_damage_is_dirty)) {
       do_paint(dpy);
     }
   }
+}
+
+static int
+paint_timeout(void) {
+  int timeout = fade_timeout();
+
+  if (g_configure_needed || all_damage_is_dirty) {
+    int64_t remaining = g_paint_interval_ms
+      - (get_time_in_milliseconds() - g_last_paint_ms);
+    int paint_wait = remaining <= 0 ? 0
+      : remaining > INT_MAX ? INT_MAX : (int)remaining;
+    if (timeout < 0 || paint_wait < timeout) timeout = paint_wait;
+  }
+  return timeout;
 }
 
 
@@ -2339,6 +2613,7 @@ main(int argc, char **argv) {
     { "shadow-green", required_argument, NULL, 0 },
     { "shadow-blue", required_argument, NULL, 0 },
     { "help", no_argument, NULL, 0 },
+    { "refresh-rate", required_argument, NULL, 0 },
     { 0, 0, 0, 0 },
   };
 
@@ -2356,6 +2631,7 @@ main(int argc, char **argv) {
   double shadow_red = 0.0;
   double shadow_green = 0.0;
   double shadow_blue = 0.0;
+  int g_override_refresh_rate = 0;
   char *display = 0;
   int o;
   int longopt_idx;
@@ -2376,10 +2652,15 @@ main(int argc, char **argv) {
        // Long options
       case 0:
         switch (longopt_idx) {
-          case 0: shadow_red = normalize_d(atof(optarg)); break;
-          case 1: shadow_green = normalize_d(atof(optarg)); break;
-          case 2: shadow_blue = normalize_d(atof(optarg)); break;
+          case 0: if (!parse_double_option(optarg, 0, 1, &shadow_red)) invalid_option("--shadow-red", optarg); break;
+          case 1: if (!parse_double_option(optarg, 0, 1, &shadow_green)) invalid_option("--shadow-green", optarg); break;
+          case 2: if (!parse_double_option(optarg, 0, 1, &shadow_blue)) invalid_option("--shadow-blue", optarg); break;
           case 3: usage(argv[0], 0); break;
+          case 4: {
+            if (!parse_int_option(optarg, 0, 1000, &g_override_refresh_rate))
+              invalid_option("--refresh-rate", optarg);
+            break;
+          }
           default:
             fprintf(stderr, "Bug, unhandeled longopt_idx %d\n", longopt_idx);
             exit(2);
@@ -2390,36 +2671,40 @@ main(int argc, char **argv) {
         display = optarg;
         break;
       case 'D':
-        fade_delta = atoi(optarg);
-        if (fade_delta < 1) {
-          fade_delta = 10;
-        }
+        if (!parse_int_option(optarg, 1, 10000, &fade_delta)) invalid_option("-D", optarg);
         break;
       case 'I':
-        fade_in_step = atof(optarg);
-        if (fade_in_step <= 0) {
-          fade_in_step = 0.01;
-        }
+        if (!parse_double_option(optarg, 0.0001, 1.0, &fade_in_step)) invalid_option("-I", optarg);
         break;
       case 'O':
-        fade_out_step = atof(optarg);
-        if (fade_out_step <= 0) {
-          fade_out_step = 0.01;
-        }
+        if (!parse_double_option(optarg, 0.0001, 1.0, &fade_out_step)) invalid_option("-O", optarg);
         break;
       case 'c':
         for (i = 1; i < NUM_WINTYPES; ++i) {
           win_type_shadow[i] = True;
         }
         win_type_shadow[WINTYPE_DESKTOP] = False;
+        // ponytail: menus/popups/tooltips are override_redirect and often
+        // ARGB/CSD, so we only know their (oversized) window rect, not the
+        // visible shape. A rect shadow then renders as a transparent box
+        // around the popup. Skip shadows for these transient types (same as
+        // the typical picom shadow-exclude). Upgrade path: honor
+        // _NET_WM_OPAQUE_REGION / XShape to draw shape-correct shadows.
+        win_type_shadow[WINTYPE_MENU] = False;
+        win_type_shadow[WINTYPE_DROPDOWN_MENU] = False;
+        win_type_shadow[WINTYPE_POPUP_MENU] = False;
+        win_type_shadow[WINTYPE_TOOLTIP] = False;
+        win_type_shadow[WINTYPE_COMBO] = False;
         break;
       case 'h': usage(argv[0], 0); break;
       case 'C':
         no_dock_shadow = True;
         break;
       case 'm':
-        win_type_opacity[WINTYPE_DROPDOWN_MENU] = atof(optarg);
-        win_type_opacity[WINTYPE_POPUP_MENU] = atof(optarg);
+        if (!parse_double_option(optarg, 0, 1, &win_type_opacity[WINTYPE_MENU])) invalid_option("-m", optarg);
+        win_type_opacity[WINTYPE_DROPDOWN_MENU] = win_type_opacity[WINTYPE_MENU];
+        win_type_opacity[WINTYPE_POPUP_MENU] = win_type_opacity[WINTYPE_MENU];
+        win_type_opacity[WINTYPE_COMBO] = win_type_opacity[WINTYPE_MENU];
         break;
       case 'f':
         for (i = 1; i < NUM_WINTYPES; ++i) {
@@ -2433,22 +2718,22 @@ main(int argc, char **argv) {
         synchronize = True;
         break;
       case 'r':
-        shadow_radius = atoi(optarg);
+        if (!parse_int_option(optarg, 1, 256, &shadow_radius)) invalid_option("-r", optarg);
         break;
       case 'o':
-        shadow_opacity = atof(optarg);
+        if (!parse_double_option(optarg, 0, 1, &shadow_opacity)) invalid_option("-o", optarg);
         break;
       case 'l':
-        shadow_offset_x = atoi(optarg);
+        if (!parse_int_option(optarg, -65535, 65535, &shadow_offset_x)) invalid_option("-l", optarg);
         break;
       case 't':
-        shadow_offset_y = atoi(optarg);
+        if (!parse_int_option(optarg, -65535, 65535, &shadow_offset_y)) invalid_option("-t", optarg);
         break;
       case 'i':
-        inactive_opacity = (double)atof(optarg);
+        if (!parse_double_option(optarg, 0, 1, &inactive_opacity)) invalid_option("-i", optarg);
         break;
       case 'e':
-        frame_opacity = (double)atof(optarg);
+        if (!parse_double_option(optarg, 0, 1, &frame_opacity)) invalid_option("-e", optarg);
         break;
       case 'n':
       case 'a':
@@ -2460,6 +2745,11 @@ main(int argc, char **argv) {
         usage(argv[0], 1);
         break;
     }
+  }
+
+  if (optind != argc) {
+    fprintf(stderr, "Unexpected argument: %s\n", argv[optind]);
+    usage(argv[0], 1);
   }
 
   if (no_dock_shadow) {
@@ -2564,10 +2854,27 @@ main(int argc, char **argv) {
     "_NET_WM_WINDOW_TYPE_DND", False);
 
   gaussian_map = make_gaussian_map(dpy, shadow_radius);
+  if (!gaussian_map) {
+    fprintf(stderr, "Unable to allocate the shadow blur map.\n");
+    exit(1);
+  }
   presum_gaussian(gaussian_map);
 
   if(!root_init()){
     exit(1);
+  }
+
+  {
+    // ponytail: XRRConfigCurrentRate is legacy/per-screen; one global cap. Per-output refresh only if mixed-rate multi-monitor matters.
+    int randr_event_base, randr_error_base;
+    XRRScreenConfiguration *cfg = XRRQueryExtension(dpy, &randr_event_base,
+        &randr_error_base) ? XRRGetScreenInfo(dpy, root) : NULL;
+    short rate = cfg ? XRRConfigCurrentRate(cfg) : 0;
+    if (cfg) XRRFreeScreenConfigInfo(cfg);
+    g_paint_interval_ms = (rate > 0) ? ((1000 + rate - 1) / rate) : 16;
+    if (g_override_refresh_rate > 0)
+      g_paint_interval_ms = (1000 + g_override_refresh_rate - 1) / g_override_refresh_rate;
+    if (g_paint_interval_ms < 1) g_paint_interval_ms = 1;  // ponytail: floor; interval 0 would disable throttle + spin
   }
 
   black_picture = solid_picture(dpy, True, 1, 0, 0, 0);
@@ -2582,6 +2889,7 @@ main(int argc, char **argv) {
   all_damage = XFixesCreateRegion(dpy, 0, 0);
   all_damage_is_dirty = False;
   g_xregion_tmp = XFixesCreateRegion(dpy, 0, 0);
+  screen_damage = XFixesCreateRegion(dpy, 0, 0);
 
   clip_changed = True;
   XGrabServer(dpy);
@@ -2614,19 +2922,21 @@ main(int argc, char **argv) {
                              .width=root_width , .height=root_height };
     XFixesSetRegion(dpy, g_xregion_tmp, &root_rect, 1);
     paint_all(dpy, g_xregion_tmp);
+    XSync(dpy, False);
+    g_last_paint_ms = get_time_in_milliseconds();
   }
 
   for (;;) {
     /*    dump_wins(); */
     do {
       if (!QLength(dpy)) {
-        // TODO: check and re-implement fade time logic.
-        int timeout = (configure_timer_started) ? 2 : fade_timeout();
-        if (unlikely(poll(&ufd, 1, timeout) == 0)) {
+        XFlush(dpy);
+        int poll_result = poll(&ufd, 1, paint_timeout());
+        if (unlikely(poll_result == 0)) {
           check_paint(dpy);
-           //   run_fades(dpy);
           break;
         }
+        if (unlikely(poll_result < 0 && errno == EINTR)) continue;
       }
 
       XNextEvent(dpy, &ev);
@@ -2734,14 +3044,16 @@ main(int argc, char **argv) {
           }
           break;
         case PropertyNotify:
-          for (p = 0; root_background_props[p]; p++) {
-            if (ev.xproperty.atom ==
-                XInternAtom(dpy, root_background_props[p], False)) {
-              if (root_tile) {
-                XClearArea(dpy, root, 0, 0, 0, 0, True);
-                XRenderFreePicture(dpy, root_tile);
-                root_tile = None;
-                break;
+          if (ev.xproperty.window == root) {
+            for (p = 0; root_background_props[p]; p++) {
+              if (ev.xproperty.atom ==
+                  XInternAtom(dpy, root_background_props[p], False)) {
+                if (root_tile) {
+                  XClearArea(dpy, root, 0, 0, 0, 0, True);
+                  XRenderFreePicture(dpy, root_tile);
+                  root_tile = None;
+                  break;
+                }
               }
             }
           }
@@ -2752,13 +3064,31 @@ main(int argc, char **argv) {
           /* check if Trans property was changed */
           if (ev.xproperty.atom == atom_opacity) {
             /* reset mode and redraw window */
-            win *w = find_win(ev.xproperty.window);
+            win *w = find_win_any_parent(ev.xproperty.window);
             if (w) {
               uint opacity = win_suggest_opacity(w, &w->userdefined_opacity);
               set_opacity(dpy, w, opacity);
             }
           } else if (ev.xproperty.atom == atom_net_wm_state) {
             add_damage_if_hidden_changed(ev.xproperty.window, false);
+          } else if (ev.xproperty.atom == atom_net_frame_extents
+                     || ev.xproperty.atom == atom_gtk_frame_extents) {
+            win *w = find_win_any_parent(ev.xproperty.window);
+            if (w) {
+              get_frame_extents(w, &w->left_width, &w->right_width,
+                &w->top_width, &w->bottom_width);
+              if (w->border_size) {
+                XFixesDestroyRegion(dpy, w->border_size);
+                w->border_size = None;
+              }
+              invalidate_shadow(dpy, w);
+            }
+          } else if (ev.xproperty.atom == atom_win_type) {
+            win *w = find_win_any_parent(ev.xproperty.window);
+            if (w) {
+              w->window_type = determine_wintype(dpy, w->id, w->id);
+              invalidate_shadow(dpy, w);
+            }
           }
           break;
         case SelectionClear:

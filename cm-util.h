@@ -1,9 +1,7 @@
 #pragma once
 
-#include <sys/time.h>
+#include <stdint.h>
 #include <string.h>
-
-extern time_t _program_start_secs;
 
 #define likely(x)       __builtin_expect(!!(x), 1)
 #define unlikely(x)     __builtin_expect(!!(x), 0)
@@ -16,12 +14,7 @@ extern time_t _program_start_secs;
 #define WRITE_ONCE(x, val) \
 do { ACCESS_ONCE(x) = (val); } while (0)
 
-static inline int
-get_time_in_milliseconds() {
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  return (tv.tv_sec-_program_start_secs) * 1000 + tv.tv_usec / 1000;
-}
+int64_t get_time_in_milliseconds(void);
 
 // normalize double to range 0-1
 static inline double normalize_d(double d) {
@@ -32,4 +25,3 @@ static inline double normalize_d(double d) {
 
   return d;
 }
-

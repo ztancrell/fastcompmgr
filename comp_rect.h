@@ -1,14 +1,15 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 typedef struct {
-    short x1;
-    short y1;
-    short x2;
-    short y2;
-    short w;
-    short h;
+    int32_t x1;
+    int32_t y1;
+    int32_t x2;
+    int32_t y2;
+    int32_t w;
+    int32_t h;
 } CompRect;
 
 

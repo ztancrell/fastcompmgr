@@ -77,6 +77,8 @@ typedef struct _win {
   int shadow_dy;
   int shadow_width;
   int shadow_height;
+  Bool shadow_9patch;      /* render from shared g_shadow_tiles[] instead of w->shadow */
+  int shadow_opacity_int;  /* g_shadow_tiles[] level (0..25), valid when shadow_9patch */
   unsigned int opacity;
   bool userdefined_opacity; // Do not set inactive opacity, if the client requests a custom
   hiddentype hidden_type;
