@@ -4,6 +4,8 @@ __fastcompmgr__ is a _fast_ compositor for X, a fork of an early version
 of __Compton__ which is a fork of __xcompmgr-dana__ which is a fork
 of __xcompmgr__.
 
+*This repository is a fork. Its recent maintenance changes were made with assistance from OpenAI GPT-5.6 Terra.*
+
 I used to use good old xcompmgr for long, because compton always
 felt a bit laggy when moving/resizing windows or kinetic-scrolling
 a webpage. Having tested the latest picom-10.2, it seems, things got even
