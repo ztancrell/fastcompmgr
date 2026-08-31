@@ -65,6 +65,7 @@ Otherwise, install the development versions of the following libraries:
 * libxfixes
 * libxrender
 * libxrandr
+* libxext
 * pkg-config
 * make
 * a C compiler
@@ -127,8 +128,10 @@ All options:
     Green color value of shadow (0.0 - 1.0, defaults to 0).
     --shadow-blue value
     Blue color value of shadow (0.0 - 1.0, defaults to 0).
-    --refresh-rate N
+   --refresh-rate N
     Override display refresh rate in Hz (0 = autodetect via XRandR, default).
+   --print-stats
+    Print one-line rendering statistics once per second to stderr.
 
 ~~~
 

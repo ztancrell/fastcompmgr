@@ -31,6 +31,7 @@
 #include <X11/extensions/Xdamage.h>
 #include <X11/extensions/Xrender.h>
 #include <X11/extensions/Xrandr.h>
+#include <X11/extensions/shape.h>
 
 #include "cm-global.h"
 #include "cm-event.h"
@@ -81,9 +82,15 @@ int xfixes_event, xfixes_error;
 int damage_event, damage_error;
 int composite_event, composite_error;
 int render_event, render_error;
+int shape_event, shape_error;
 Bool synchronize;
+Bool has_shape;
+Bool print_stats;
 int composite_opcode;
 static Bool g_paint_ignore_region_is_dirty = True;
+static uint64_t stats_events, stats_damage_events, stats_paints;
+static uint64_t stats_shadow_windows, stats_submit_ms;
+static int64_t stats_started_ms;
 
 Atom win_type[NUM_WINTYPES];
 double win_type_opacity[NUM_WINTYPES];
@@ -133,6 +140,8 @@ static void
 invalidate_shadow(Display *dpy, win *w);
 static void
 add_damage(Display *dpy, XserverRegion damage);
+static void
+report_stats(void);
 
 int shadow_radius = 12;
 int shadow_offset_x = -15;
@@ -541,15 +550,21 @@ make_shadow(Display *dpy, double opacity,
   unsigned char *data;
   int gsize = gaussian_map->size;
   int ylimit, xlimit;
-  int swidth = width + gsize;
-  int sheight = height + gsize;
+  int swidth, sheight;
   int center = gsize / 2;
   int x, y;
   unsigned char d;
   int x_diff;
   int opacity_int = (int)(opacity * 25);
+  size_t shadow_size;
 
-  data = malloc(swidth * sheight * sizeof(unsigned char));
+  if (width < 0 || height < 0 || gsize < 0
+      || width > INT_MAX - gsize || height > INT_MAX - gsize) return 0;
+  swidth = width + gsize;
+  sheight = height + gsize;
+  shadow_size = (size_t)swidth * (size_t)sheight;
+
+  data = malloc(shadow_size);
   if (!data) return 0;
 
   ximage = XCreateImage(
@@ -577,7 +592,7 @@ make_shadow(Display *dpy, double opacity,
       opacity, center, center, width, height);
   }
 
-  memset(data, d, sheight * swidth);
+  memset(data, d, shadow_size);
 
   /*
    * corners
@@ -746,6 +761,19 @@ typedef struct {
 
 static shadow_tiles g_shadow_tiles[26];
 
+static void
+free_shadow_tiles(Display *dpy, shadow_tiles *tiles) {
+  Picture *pictures[] = {
+    &tiles->corner_tl, &tiles->corner_tr, &tiles->corner_bl,
+    &tiles->corner_br, &tiles->edge_top, &tiles->edge_bottom,
+    &tiles->edge_left, &tiles->edge_right, &tiles->center,
+  };
+  for (size_t i = 0; i < sizeof(pictures) / sizeof(pictures[0]); i++) {
+    if (*pictures[i]) XRenderFreePicture(dpy, *pictures[i]);
+  }
+  memset(tiles, 0, sizeof(*tiles));
+}
+
 // Wrap an 8-bit alpha buffer as an A8 Picture. Mirrors shadow_picture()'s
 // proven pixmap->picture->free-pixmap dance; XDestroyImage frees `data`.
 static Picture
@@ -802,50 +830,63 @@ ensure_shadow_tiles(Display *dpy, int op) {
   unsigned char *d;
 
   // corners (g x g): TL, and h/v mirrors for the other three
-  d = malloc(g * g);
+  d = malloc(g * g); if (!d) goto fail;
   for (y = 0; y < g; y++) for (x = 0; x < g; x++)
     d[y * g + x] = sum_gaussian(gaussian_map, od, x - center, y - center, win, win);
   g_shadow_tiles[op].corner_tl = a8_picture_from_data(dpy, d, g, g, False);
+  if (!g_shadow_tiles[op].corner_tl) goto fail;
 
-  d = malloc(g * g);
+  d = malloc(g * g); if (!d) goto fail;
   for (y = 0; y < g; y++) for (x = 0; x < g; x++)
     d[y * g + x] = sum_gaussian(gaussian_map, od, (g - 1 - x) - center, y - center, win, win);
   g_shadow_tiles[op].corner_tr = a8_picture_from_data(dpy, d, g, g, False);
+  if (!g_shadow_tiles[op].corner_tr) goto fail;
 
-  d = malloc(g * g);
+  d = malloc(g * g); if (!d) goto fail;
   for (y = 0; y < g; y++) for (x = 0; x < g; x++)
     d[y * g + x] = sum_gaussian(gaussian_map, od, x - center, (g - 1 - y) - center, win, win);
   g_shadow_tiles[op].corner_bl = a8_picture_from_data(dpy, d, g, g, False);
+  if (!g_shadow_tiles[op].corner_bl) goto fail;
 
-  d = malloc(g * g);
+  d = malloc(g * g); if (!d) goto fail;
   for (y = 0; y < g; y++) for (x = 0; x < g; x++)
     d[y * g + x] = sum_gaussian(gaussian_map, od, (g - 1 - x) - center, (g - 1 - y) - center, win, win);
   g_shadow_tiles[op].corner_br = a8_picture_from_data(dpy, d, g, g, False);
+  if (!g_shadow_tiles[op].corner_br) goto fail;
 
   // top/bottom edges (1 wide x g tall, repeated horizontally)
-  d = malloc(g);
+  d = malloc(g); if (!d) goto fail;
   for (y = 0; y < g; y++) d[y] = sum_gaussian(gaussian_map, od, y - center, center, win, win);
   g_shadow_tiles[op].edge_top = a8_picture_from_data(dpy, d, 1, g, True);
+  if (!g_shadow_tiles[op].edge_top) goto fail;
 
-  d = malloc(g);
+  d = malloc(g); if (!d) goto fail;
   for (y = 0; y < g; y++) d[y] = sum_gaussian(gaussian_map, od, (g - 1 - y) - center, center, win, win);
   g_shadow_tiles[op].edge_bottom = a8_picture_from_data(dpy, d, 1, g, True);
+  if (!g_shadow_tiles[op].edge_bottom) goto fail;
 
   // left/right edges (g wide x 1 tall, repeated vertically)
-  d = malloc(g);
+  d = malloc(g); if (!d) goto fail;
   for (x = 0; x < g; x++) d[x] = sum_gaussian(gaussian_map, od, x - center, center, win, win);
   g_shadow_tiles[op].edge_left = a8_picture_from_data(dpy, d, g, 1, True);
+  if (!g_shadow_tiles[op].edge_left) goto fail;
 
-  d = malloc(g);
+  d = malloc(g); if (!d) goto fail;
   for (x = 0; x < g; x++) d[x] = sum_gaussian(gaussian_map, od, (g - 1 - x) - center, center, win, win);
   g_shadow_tiles[op].edge_right = a8_picture_from_data(dpy, d, g, 1, True);
+  if (!g_shadow_tiles[op].edge_right) goto fail;
 
   // solid center
-  d = malloc(1);
+  d = malloc(1); if (!d) goto fail;
   d[0] = sum_gaussian(gaussian_map, od, center, center, win, win);
   g_shadow_tiles[op].center = a8_picture_from_data(dpy, d, 1, 1, True);
+  if (!g_shadow_tiles[op].center) goto fail;
 
   g_shadow_tiles[op].built = True;
+  return;
+
+fail:
+  free_shadow_tiles(dpy, &g_shadow_tiles[op]);
 }
 
 // Composite a window's shadow from the 9 shared tiles (replaces the single
@@ -860,6 +901,8 @@ render_shadow_9patch(Display *dpy, win *w) {
   const int sh = w->shadow_height;
   const int mw = sw - 2 * g;   // middle (stretched) width  > 0 by eligibility
   const int mh = sh - 2 * g;   // middle (stretched) height > 0 by eligibility
+
+  if (print_stats) stats_shadow_windows++;
 
 #define COMP(mask, dx, dy, ww, hh) \
   XRenderComposite(dpy, PictOpOver, cshadow_picture, (mask), root_buffer, \
@@ -982,10 +1025,17 @@ win_extents(Display *dpy, win *w) {
         XRenderFreePicture(dpy, w->shadow);
         w->shadow = None;
       }
-      w->shadow_9patch = True;
-      w->shadow_opacity_int = op;
-      w->shadow_width = win_w + gsize;
-      w->shadow_height = win_h + gsize;
+      if (g_shadow_tiles[op].built) {
+        w->shadow_9patch = True;
+        w->shadow_opacity_int = op;
+        w->shadow_width = win_w + gsize;
+        w->shadow_height = win_h + gsize;
+      } else {
+        w->shadow_9patch = False;
+        w->shadow = shadow_picture(
+          dpy, opacity, w->shadow_type,
+          win_w, win_h, &w->shadow_width, &w->shadow_height);
+      }
     } else {
       w->shadow_9patch = False;
       if (!w->shadow) {
@@ -1099,6 +1149,19 @@ find_client_win(Display *dpy, Window win) {
   return client;
 }
 
+static Window
+cached_client_win(Display *dpy, win *w) {
+  if (!w->client_win) w->client_win = find_client_win(dpy, w->id);
+  return w->client_win;
+}
+
+static void
+invalidate_client_cache(Window client) {
+  for (win *w = list; w; w = w->next) {
+    if (w->client_win == client) w->client_win = None;
+  }
+}
+
 static void
 get_frame_extents(win* w,
                   unsigned int *left,
@@ -1118,7 +1181,7 @@ get_frame_extents(win* w,
   *top = 0;
   *bottom = 0;
 
-  client_window = find_client_win(dpy, w->id);
+  client_window = cached_client_win(dpy, w);
   if (!client_window) {
     w->hidden_type = win_state_is_hidden( w->id) ? HIDDEN_YES : HIDDEN_NO;
     return;
@@ -1174,7 +1237,7 @@ win_paint_needed(win* w, CompRect* ignore_reg){
     case HIDDEN_UNKNOWN: {
       fprintf(stderr, "fastcompmgr warning: hidden state still unknown in "
                       "win_paint_needed: 0x%lx\n", w->id);
-      Window client_window = find_client_win(dpy, w->id);
+      Window client_window = cached_client_win(dpy, w);
       if (!client_window) {
         // We already tried to find a client on add_win - give up for now.
         w->hidden_type = HIDDEN_IGNORE;
@@ -1223,12 +1286,19 @@ paint_all(Display *dpy, XserverRegion region) {
     Pixmap rootPixmap = XCreatePixmap(
       dpy, root, root_width, root_height,
       DefaultDepth(dpy, g_screen));
+    if (!rootPixmap) {
+      fprintf(stderr, "Unable to create the compositor back buffer.\n");
+      exit(1);
+    }
 
     root_buffer = XRenderCreatePicture(dpy, rootPixmap,
       XRenderFindVisualFormat(dpy, DefaultVisual(dpy, g_screen)),
       0, 0);
-
     XFreePixmap(dpy, rootPixmap);
+    if (!root_buffer) {
+      fprintf(stderr, "Unable to create the compositor back-buffer picture.\n");
+      exit(1);
+    }
   }
 #endif
 
@@ -1352,7 +1422,9 @@ paint_all(Display *dpy, XserverRegion region) {
       root_buffer, 0, 0, w->border_clip);
 
     if(shadow_should_render(w->shadow_type)) {
+      if (print_stats) stats_shadow_windows++;
       if (w->shadow_9patch) {
+        if (print_stats) stats_shadow_windows--;
         render_shadow_9patch(dpy, w);
       } else if (w->shadow) {
         XRenderComposite(
@@ -1439,11 +1511,11 @@ paint_all(Display *dpy, XserverRegion region) {
   }
 
 #if ! MONITOR_REPAINT
-    XFixesSetPictureClipRegion(dpy, root_buffer, 0, 0, screen_damage);
-    XRenderComposite(
-      dpy, PictOpSrc, root_buffer, None,
-      root_picture, 0, 0, 0, 0,
-      0, 0, root_width, root_height);
+  XFixesSetPictureClipRegion(dpy, root_buffer, 0, 0, screen_damage);
+  XRenderComposite(
+    dpy, PictOpSrc, root_buffer, None,
+    root_picture, 0, 0, 0, 0,
+    0, 0, root_width, root_height);
 #endif // ! MONITOR_REPAINT
 }
 
@@ -1642,6 +1714,20 @@ static void
 handle_ConfigureNotify(Display *dpy, XConfigureEvent *ce);
 
 static void
+handle_shape_notify(Display *dpy, XShapeEvent *se) {
+  win *w = find_win(se->window);
+
+  if (!w) return;
+  if (w->border_size) {
+    XFixesDestroyRegion(dpy, w->border_size);
+    w->border_size = None;
+  }
+  if (w->extents) add_damage(dpy, w->extents);
+  clip_changed = True;
+  set_paint_ignore_region_dirty();
+}
+
+static void
 map_win(Display *dpy, Window id,
         unsigned long sequence, Bool fade) {
   win *w = find_win(id);
@@ -1658,7 +1744,8 @@ map_win(Display *dpy, Window id,
 
   /* select before reading the property
      so that no property changes are lost */
-  XSelectInput(dpy, id, PropertyChangeMask | FocusChangeMask);
+  XSelectInput(dpy, id, PropertyChangeMask | FocusChangeMask
+    | (has_shape ? ShapeNotifyMask : 0));
 
   w->opacity = win_suggest_opacity(w, &w->userdefined_opacity);
 
@@ -1806,7 +1893,7 @@ get_opacity_prop(Display *dpy, win *w, unsigned int def) {
   unsigned int opacity;
   if (get_opacity_prop_for_window(dpy, w->id, &opacity)) return opacity;
 
-  Window client = find_client_win(dpy, w->id);
+  Window client = cached_client_win(dpy, w);
   if (client && client != w->id
       && get_opacity_prop_for_window(dpy, client, &opacity)) return opacity;
   return def;
@@ -2096,6 +2183,14 @@ handle_ConfigureNotify(Display *dpy, XConfigureEvent *ce) {
       }
       root_width = ce->width;
       root_height = ce->height;
+      if (all_damage && root_width > 0 && root_height > 0) {
+        XRectangle full = { 0, 0, (unsigned short)root_width,
+          (unsigned short)root_height };
+        XFixesSetRegion(dpy, all_damage, &full, 1);
+        all_damage_is_dirty = True;
+      }
+      clip_changed = True;
+      set_paint_ignore_region_dirty();
     }
     return;
   }
@@ -2510,7 +2605,10 @@ usage(char *program, int exitcode) {
     --shadow-blue value
     Blue color value of shadow (0.0 - 1.0, defaults to 0).
     --refresh-rate N
-    Override display refresh rate in Hz (0 = autodetect via XRandR, default).)SOMERANDOMTEXT"
+    Override display refresh rate in Hz (0 = autodetect via XRandR, default).
+    --print-stats
+    Print one-line rendering statistics once per second to stderr.
+    )SOMERANDOMTEXT"
   );
   fprintf(stderr, "\n");
 
@@ -2572,16 +2670,52 @@ static void run_configures(Display *dpy){
 
 static void
 do_paint(Display *dpy){
+   int64_t started_at;
+   int64_t submitted_at;
+
    if (!all_damage_is_dirty) return;
+   started_at = get_time_in_milliseconds();
    paint_all(dpy, all_damage);
    if (synchronize) {
      XSync(dpy, False);
    } else {
      XFlush(dpy);
    }
-   g_last_paint_ms = get_time_in_milliseconds();
+   submitted_at = get_time_in_milliseconds();
+   if (print_stats) {
+     stats_paints++;
+     stats_submit_ms += submitted_at - started_at;
+   }
+   g_last_paint_ms = submitted_at;
    all_damage_is_dirty = False;
    clip_changed = False;
+}
+
+static void
+report_stats(void) {
+  int64_t now;
+  int64_t elapsed;
+
+  if (!print_stats) return;
+  now = get_time_in_milliseconds();
+  if (!stats_started_ms) {
+    stats_started_ms = now;
+    return;
+  }
+  elapsed = now - stats_started_ms;
+  if (elapsed < 1000) return;
+
+  fprintf(stderr,
+    "fastcompmgr stats: events=%llu damage=%llu paints=%llu shadows=%llu submit-ms=%llu interval-ms=%lld\n",
+    (unsigned long long)stats_events,
+    (unsigned long long)stats_damage_events,
+    (unsigned long long)stats_paints,
+    (unsigned long long)stats_shadow_windows,
+    (unsigned long long)stats_submit_ms,
+    (long long)elapsed);
+  stats_events = stats_damage_events = stats_paints = 0;
+  stats_shadow_windows = stats_submit_ms = 0;
+  stats_started_ms = now;
 }
 
 static void
@@ -2623,6 +2757,7 @@ main(int argc, char **argv) {
     { "shadow-blue", required_argument, NULL, 0 },
     { "help", no_argument, NULL, 0 },
     { "refresh-rate", required_argument, NULL, 0 },
+    { "print-stats", no_argument, NULL, 0 },
     { 0, 0, 0, 0 },
   };
 
@@ -2670,6 +2805,7 @@ main(int argc, char **argv) {
               invalid_option("--refresh-rate", optarg);
             break;
           }
+          case 5: print_stats = True; break;
           default:
             fprintf(stderr, "Bug, unhandeled longopt_idx %d\n", longopt_idx);
             exit(2);
@@ -2808,6 +2944,8 @@ main(int argc, char **argv) {
     fprintf(stderr, "No XFixes extension\n");
     exit(1);
   }
+
+  has_shape = XShapeQueryExtension(dpy, &shape_event, &shape_error);
 
   if(! register_cm(dpy))
     exit(1);
@@ -2955,6 +3093,7 @@ main(int argc, char **argv) {
       }
 
       XNextEvent(dpy, &ev);
+      if (print_stats) stats_events++;
 
       if (likely((ev.type & 0x7f) != KeymapNotify)) {
         discard_ignore(dpy, ev.xany.serial);
@@ -3004,6 +3143,7 @@ main(int argc, char **argv) {
           handle_ConfigureNotify(dpy, &ev.xconfigure);
           break;
         case DestroyNotify:
+          invalidate_client_cache(ev.xdestroywindow.window);
           destroy_win(dpy, ev.xdestroywindow.window, True);
           break;
         case MapNotify:
@@ -3013,6 +3153,7 @@ main(int argc, char **argv) {
           unmap_win(dpy, ev.xunmap.window, True);
           break;
         case ReparentNotify:
+          invalidate_client_cache(ev.xreparent.window);
           // Reparent for instance occurs, when the window manager restarts. In the
           // process, events we registered for previously are lost. Events for toplevel
           // windows, as well as PropertyChange events for non-toplevel clients are
@@ -3038,12 +3179,25 @@ main(int argc, char **argv) {
           if (ev.xexpose.window == root) {
             int more = ev.xexpose.count + 1;
             if (n_expose == size_expose) {
-              if (expose_rects) {
-                expose_rects = realloc(expose_rects,
+            if (expose_rects) {
+                XRectangle *new_rects = realloc(expose_rects,
                   (size_expose + more) * sizeof(XRectangle));
+                if (!new_rects) {
+                  fprintf(stderr, "Unable to grow expose-event storage.\n");
+                  free(expose_rects);
+                  expose_rects = NULL;
+                  size_expose = n_expose = 0;
+                  break;
+                }
+                expose_rects = new_rects;
                 size_expose += more;
               } else {
                 expose_rects = malloc(more * sizeof(XRectangle));
+                if (!expose_rects) {
+                  fprintf(stderr, "Unable to allocate expose-event storage.\n");
+                  size_expose = n_expose = 0;
+                  break;
+                }
                 size_expose = more;
               }
             }
@@ -3112,7 +3266,10 @@ main(int argc, char **argv) {
           exit(0);
           break;
         default:
-          if (likely(ev.type == damage_event + XDamageNotify)) {
+          if (has_shape && ev.type == shape_event + ShapeNotify) {
+            handle_shape_notify(dpy, (XShapeEvent *)&ev);
+          } else if (likely(ev.type == damage_event + XDamageNotify)) {
+            if (print_stats) stats_damage_events++;
             damage_win(dpy, (XDamageNotifyEvent *)&ev);
           }
           break;
@@ -3125,5 +3282,6 @@ main(int argc, char **argv) {
     }
 
     check_paint(dpy);
+    report_stats();
   }
 }

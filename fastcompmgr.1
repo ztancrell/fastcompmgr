@@ -4,7 +4,7 @@
 fastcompmgr \- a _fast_ compositor for X11
 .SH SYNOPSIS
 .nf
-.B fastcompmgr [\-d display] [\-r radius] [\-o opacity] [\-l left-offset] [\-t top-offset] [\-m opacity] [\-i opacity] [\-e opacity] [\-I step] [\-O step] [\-D milliseconds] [\-cCfFS] [\-\-shadow-red value] [\-\-shadow-green value] [\-\-shadow-blue value] [\-\-refresh-rate Hz]
+.B fastcompmgr [\-d display] [\-r radius] [\-o opacity] [\-l left-offset] [\-t top-offset] [\-m opacity] [\-i opacity] [\-e opacity] [\-I step] [\-O step] [\-D milliseconds] [\-cCfFS] [\-\-shadow-red value] [\-\-shadow-green value] [\-\-shadow-blue value] [\-\-refresh-rate Hz] [\-\-print-stats]
 .fi
 .SH DESCRIPTION
 .B fastcompmgr
@@ -82,6 +82,9 @@ Specifies shadow blue intensity. (0.0 - 1.0)
 .TP
 .BI \-\-refresh-rate\ Hz
 Overrides the display refresh rate. Zero selects XRandR autodetection.
+.TP
+.B \-\-print-stats
+Prints one line of rendering statistics per second to standard error.
 .SH BUGS
 Bugs may be reported to https://github.com/ztancrell/fastcompmgr
 .SH AUTHORS

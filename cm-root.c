@@ -164,4 +164,3 @@ Picture root_create_tile() {
   }
   return picture;
 }
-

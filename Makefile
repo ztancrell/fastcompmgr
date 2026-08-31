@@ -1,4 +1,4 @@
-PACKAGES = x11 xcomposite xfixes xdamage xrender xrandr
+PACKAGES = x11 xcomposite xfixes xdamage xrender xrandr xext
 PKG_CONFIG ?= pkg-config
 LIBS = $(shell $(PKG_CONFIG) --libs $(PACKAGES)) -lm
 INCS = $(shell $(PKG_CONFIG) --cflags $(PACKAGES))
@@ -11,7 +11,8 @@ INSTALL ?= install
 
 OBJS = fastcompmgr.o comp_rect.o cm-root.o cm-global.o cm-util.o cm-window.o cm-event.o
 DEPS = $(OBJS:.o=.d) $(TEST_OBJS:.o=.d)
-TEST_BINS = tests/test_comp_rect tests/test_ringbuffer tests/test_ringbuffer_no_modulo
+TEST_BINS = tests/test_comp_rect tests/test_ringbuffer tests/test_ringbuffer_no_modulo \
+	tests/test_x11_window_lifecycle
 TEST_OBJS = tests/test_comp_rect.o tests/comp_rect.o tests/test_ringbuffer.o \
 	tests/test_ringbuffer_no_modulo.o
 
@@ -42,6 +43,9 @@ tests/test_ringbuffer_no_modulo.o: tests/test_ringbuffer.c
 
 tests/test_ringbuffer_no_modulo: tests/test_ringbuffer_no_modulo.o
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
+
+tests/test_x11_window_lifecycle: tests/test_x11_window_lifecycle.o
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(shell $(PKG_CONFIG) --libs x11)
 
 test: $(TEST_BINS)
 	./tests/test_comp_rect

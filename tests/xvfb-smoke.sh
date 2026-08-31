@@ -93,4 +93,14 @@ if ! kill -0 "$compositor_pid" 2>/dev/null; then
     exit 1
 fi
 
+if [ -x ./tests/test_x11_window_lifecycle ]; then
+    DISPLAY=$display ./tests/test_x11_window_lifecycle
+fi
+
+if ! kill -0 "$compositor_pid" 2>/dev/null; then
+    echo "Xvfb smoke test: compositor exited during window lifecycle test" >&2
+    sed -n '1,160p' "$compositor_log" >&2
+    exit 1
+fi
+
 echo "Xvfb smoke test: passed"

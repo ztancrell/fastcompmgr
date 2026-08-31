@@ -55,6 +55,7 @@ typedef enum {
 typedef struct _win {
   struct _win *next;
   Window id;
+  Window client_win; /* Cached WM_STATE-bearing child; cleared on reparent/destroy. */
 #if HAS_NAME_WINDOW_PIXMAP
   Pixmap pixmap;
 #endif
