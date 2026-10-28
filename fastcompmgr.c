@@ -935,9 +935,15 @@ paint_root(Display *dpy) {
 }
 
 static shadowtype shadow_find_type(win *w){
-  if(unlikely(!w->window_type) ||
-     ! win_type_shadow[w->window_type] ||
-     is_gtk_frame_extent(dpy, w->id)){
+  if(unlikely(!w->window_type) || ! win_type_shadow[w->window_type]){
+    return SHADOW_NO;
+  }
+  // XGetWindowProperty is a round-trip; shadow_type is re-derived on every fade step.
+  if (!w->gtk_frame_checked) {
+    w->is_gtk_frame = is_gtk_frame_extent(dpy, w->id);
+    w->gtk_frame_checked = true;
+  }
+  if (w->is_gtk_frame) {
     return SHADOW_NO;
   }
   if (w->mode == WINDOW_SOLID && ! w->a.override_redirect) {
@@ -1011,12 +1017,12 @@ win_extents(Display *dpy, win *w) {
     w->shadow_dx = shadow_offset_x;
     w->shadow_dy = shadow_offset_y;
 
-    // 9-patch fast path: a full (opaque-center) shadow on a window bigger than
-    // the blur kernel is just corners+edges+solid-center, all size-independent.
-    // Composite it from shared tiles so a resize never rebuilds an O(w*h) mask.
-    // SHADOW_NOCENTER keeps the per-window path (its cleared center depends on
-    // window size/offset), as do windows too small to tile.
-    if (w->shadow_type == SHADOW_FULL && gsize > 0 && win_w > gsize && win_h > gsize) {
+    // 9-patch fast path: a shadow on a window bigger than the blur kernel is
+    // just corners+edges+solid-center, all size-independent. Composite it from
+    // shared tiles so a resize or fade step never rebuilds an O(w*h) mask.
+    // SHADOW_NOCENTER's cleared center is applied as a paint-time clip instead.
+    // Windows too small to tile keep the per-window path.
+    if (w->shadow_type != SHADOW_UNKNOWN && gsize > 0 && win_w > gsize && win_h > gsize) {
       int op = (int)(opacity * 25);
       if (op < 0) op = 0;
       if (op > 25) op = 25;
@@ -1425,6 +1431,17 @@ paint_all(Display *dpy, XserverRegion region) {
       if (print_stats) stats_shadow_windows++;
       if (w->shadow_9patch) {
         if (print_stats) stats_shadow_windows--;
+        if (w->shadow_type == SHADOW_NOCENTER) {
+          // Same result as make_transparent_shadowcenter(): no shadow under the window.
+          static XserverRegion shadow_clip;
+          XRectangle wr = { w->a.x, w->a.y,
+            w->a.width + w->a.border_width * 2,
+            w->a.height + w->a.border_width * 2 };
+          if (!shadow_clip) shadow_clip = XFixesCreateRegion(dpy, 0, 0);
+          XFixesSetRegion(dpy, shadow_clip, &wr, 1);
+          XFixesSubtractRegion(dpy, shadow_clip, w->border_clip, shadow_clip);
+          XFixesSetPictureClipRegion(dpy, root_buffer, 0, 0, shadow_clip);
+        }
         render_shadow_9patch(dpy, w);
       } else if (w->shadow) {
         XRenderComposite(
@@ -1736,6 +1753,7 @@ map_win(Display *dpy, Window id,
 
   w->a.map_state = IsViewable;
   w->window_type = determine_wintype(dpy, w->id, w->id);
+  w->gtk_frame_checked = false; /* property events are not selected while unmapped */
 
 #if 0
   printf("window 0x%x type %s\n",
@@ -3250,6 +3268,7 @@ main(int argc, char **argv) {
                 XFixesDestroyRegion(dpy, w->border_size);
                 w->border_size = None;
               }
+              w->gtk_frame_checked = false;
               invalidate_shadow(dpy, w);
             }
           } else if (ev.xproperty.atom == atom_win_type) {

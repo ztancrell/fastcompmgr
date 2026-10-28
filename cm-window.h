@@ -85,6 +85,8 @@ typedef struct _win {
   hiddentype hidden_type;
   wintype window_type;
   shadowtype shadow_type;
+  bool gtk_frame_checked; /* is_gtk_frame valid; cleared on map / property change */
+  bool is_gtk_frame;
   unsigned long damage_sequence; /* sequence when damage was created */
   Bool destroyed;
   Bool paint_needed;
