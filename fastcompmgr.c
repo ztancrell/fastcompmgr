@@ -1269,7 +1269,7 @@ win_paint_needed(win* w, CompRect* ignore_reg){
     // (s. e.g. xfce4-screenshooter
     // screenshooter-capture.c::get_rectangle_screenshot_composited )
     if (w->a.map_state != IsViewable || w->destroyed || w->opacity != OPAQUE ||
-        w->a.override_redirect){
+        w->mode != WINDOW_SOLID || w->a.override_redirect){
       return True;
     }
     CompRect w_rect = {.x1 = w->a.x, .y1 = w->a.y,
@@ -1762,8 +1762,8 @@ map_win(Display *dpy, Window id,
 
   /* select before reading the property
      so that no property changes are lost */
-  XSelectInput(dpy, id, PropertyChangeMask | FocusChangeMask
-    | (has_shape ? ShapeNotifyMask : 0));
+  XSelectInput(dpy, id, PropertyChangeMask | FocusChangeMask);
+  if (has_shape) XShapeSelectInput(dpy, id, ShapeNotifyMask);
 
   w->opacity = win_suggest_opacity(w, &w->userdefined_opacity);
 
@@ -1894,13 +1894,10 @@ get_opacity_prop_for_window(Display *dpy, Window window, unsigned int *opacity) 
 
   if (result == Success && data != NULL && actual == XA_CARDINAL
       && format == 32 && n == 1 && left == 0) {
-    unsigned long value = ((unsigned long *)data)[0];
+    /* Xlib hands format-32 data back as sign-extended longs */
+    *opacity = (uint32_t)((unsigned long *)data)[0];
     XFree((void *)data);
-    if (value <= UINT_MAX) {
-      *opacity = (unsigned int)value;
-      return true;
-    }
-    return false;
+    return true;
   }
   if (data) XFree((void *)data);
   return false;
